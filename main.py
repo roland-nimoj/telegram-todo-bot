@@ -6,7 +6,7 @@ Telegram-бот «Todo-List» на aiogram 3 и SQLite.
     вывод списка и выгрузка в CSV.
 
 Как запустить:
-    1. Вставьте токен в BOT_TOKEN ниже (или задайте переменную окружения BOT_TOKEN).
+    1. Скопируйте .env.example в .env и вставьте токен от @BotFather.
     2. pip install -r requirements.txt
     3. python main.py
 """
@@ -17,6 +17,7 @@ import io
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router, types
@@ -30,9 +31,34 @@ from aiogram.types import BufferedInputFile
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-# Токен бота: вставьте свой токен от @BotFather вместо плейсхолдера.
-# Если задана переменная окружения BOT_TOKEN, она имеет приоритет.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА")
+# Путь к секретному файлу с токеном. Он в .gitignore и в git не попадает.
+ENV_PATH = Path(__file__).parent / ".env"
+
+
+def load_env_file(path: Path = ENV_PATH) -> None:
+    """Читает KEY=VALUE из .env и кладёт значения в os.environ.
+
+    Нужен, чтобы хранить BOT_TOKEN вне main.py и не коммитить секрет.
+    Уже заданные переменные окружения не перезаписываем:
+    так можно запускать бота с export BOT_TOKEN=... без правки файла.
+    """
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key:
+            os.environ.setdefault(key, value)
+
+
+# Сначала подхватываем .env, затем читаем токен из окружения.
+load_env_file()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Имя файла SQLite. Файл создаётся рядом со скриптом при первом запуске.
 DB_PATH = "tasks.db"
@@ -305,10 +331,11 @@ async def main() -> None:
     MemoryStorage хранит FSM в оперативной памяти — для домашки достаточно.
     После перезапуска незавершённый /add придётся начать заново.
     """
-    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА":
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "Не задан токен бота. Вставьте его в BOT_TOKEN в начале main.py "
-            "или установите переменную окружения BOT_TOKEN."
+            "Не задан токен бота. Создайте файл .env рядом с main.py "
+            "(см. .env.example) и укажите BOT_TOKEN=... "
+            "либо задайте переменную окружения BOT_TOKEN."
         )
 
     await init_db()
