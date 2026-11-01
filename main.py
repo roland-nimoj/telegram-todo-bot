@@ -25,7 +25,12 @@ from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import (
+    BotCommand,
+    BufferedInputFile,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -71,6 +76,22 @@ DONE_STATUS = "Выполнено"
 # Подсказки категорий на клавиатуре. Любой другой текст тоже сохранится как категория.
 SUGGESTED_CATEGORIES = ("Работа", "Дом", "Учеба")
 
+# Подписи кнопок постоянного меню. Нажатие отправляет этот текст боту.
+MENU_BUTTON = "меню/start"
+DONE_BUTTON = "/done <id>"
+
+# Текст приветствия: его показывают /start, кнопка меню и обычные сообщения.
+WELCOME_TEXT = (
+    "Привет! Я бот для хранения задач (Todo-List).\n\n"
+    "Доступные команды:\n"
+    "/add — добавить новую задачу\n"
+    "/list — показать все задачи\n"
+    "/list_csv — скачать задачи в CSV-файле\n"
+    "/done — отметить задачу выполненной\n\n"
+    "Команды также доступны кнопками меню внизу экрана.\n"
+    "Начните с /add, чтобы сохранить первую задачу."
+)
+
 # Настройка логов, чтобы в консоли было видно ошибки и входящие апдейты.
 logging.basicConfig(
     level=logging.INFO,
@@ -83,7 +104,7 @@ router = Router()
 
 
 # ---------------------------------------------------------------------------
-# FSM: состояния диалога при добавлении задачи
+# FSM: состояния диалога
 # ---------------------------------------------------------------------------
 
 class AddTaskStates(StatesGroup):
@@ -97,6 +118,35 @@ class AddTaskStates(StatesGroup):
     waiting_for_category = State()
 
 
+class DoneTaskStates(StatesGroup):
+    """Состояние FSM для /done без номера задачи.
+
+    waiting_for_id — бот ждёт, пока пользователь пришлёт id.
+    """
+
+    waiting_for_id = State()
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Постоянные кнопки меню. Каждая кнопка дублирует соответствующую команду."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=MENU_BUTTON),
+                KeyboardButton(text="/add"),
+            ],
+            [
+                KeyboardButton(text="/list"),
+                KeyboardButton(text="/list_csv"),
+            ],
+            [
+                KeyboardButton(text=DONE_BUTTON),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def category_keyboard() -> ReplyKeyboardMarkup:
     """Клавиатура с типовыми категориями.
 
@@ -107,6 +157,11 @@ def category_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+
+
+async def send_welcome(message: types.Message) -> None:
+    """Отправляет стартовое приветствие и показывает кнопки меню."""
+    await message.answer(WELCOME_TEXT, reply_markup=main_menu_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -257,71 +312,105 @@ def user_label(from_user: types.User) -> str:
     return full_name or str(from_user.id)
 
 
+def parse_task_id(raw: str | None) -> int | None:
+    """Достаёт числовой id задачи из текста.
+
+    Принимает «1» или «/done 1». Плейсхолдер «<id>» с кнопки меню не считается номером.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text or text in {"<id>", DONE_BUTTON}:
+        return None
+    if text.isdigit():
+        return int(text)
+    return None
+
+
+async def finish_done(message: types.Message, task_id: int, state: FSMContext) -> None:
+    """Помечает задачу выполненной и отвечает пользователю."""
+    task = await mark_task_done(task_id)
+    await state.clear()
+    if task is None:
+        await message.answer(
+            f"Задача с ID {task_id} не найдена. Проверьте номер в /list.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    saved_id, text, status, category = task
+    await message.answer(
+        f"Задача [{saved_id}] отмечена как «{status}».\n"
+        f"{text} (Категория: {category})",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def ask_done_id(message: types.Message, state: FSMContext) -> None:
+    """Просит номер задачи, если /done вызвали без id или нажали кнопку меню."""
+    await state.set_state(DoneTaskStates.waiting_for_id)
+    await message.answer(
+        "Введите номер задания, которое выполнено.\n"
+        "Номер можно посмотреть в /list. Для отмены отправьте /cancel.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 # ---------------------------------------------------------------------------
-# Хендлеры команд
+# Хендлеры команд и кнопок меню
 # ---------------------------------------------------------------------------
 
 @router.message(CommandStart())
+@router.message(F.text == MENU_BUTTON)
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
-    """Обрабатывает /start: приветствие и краткая инструкция.
+    """Обрабатывает /start и кнопку «меню/start».
 
-    Дополнительно сбрасываем FSM, чтобы «зависшее» ожидание текста
-    после /add не мешало обычным командам.
+    Сбрасываем FSM и показываем приветствие со списком команд.
     """
     await state.clear()
-    await message.answer(
-        "Привет! Я бот для хранения задач (Todo-List).\n\n"
-        "Доступные команды:\n"
-        "/add — добавить новую задачу\n"
-        "/list — показать все задачи\n"
-        "/list_csv — скачать задачи в CSV-файле\n"
-        "/done <id> — отметить задачу выполненной\n\n"
-        "Начните с /add, чтобы сохранить первую задачу.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await send_welcome(message)
 
 
 @router.message(Command("add"))
 async def cmd_add(message: types.Message, state: FSMContext) -> None:
-    """Обрабатывает /add: переводит пользователя в состояние waiting_for_task.
-
-    Текст и категорию спрашиваем отдельными шагами FSM, в БД пишем только в конце.
-    """
+    """Обрабатывает /add и кнопку /add: ждём текст задачи."""
     await state.set_state(AddTaskStates.waiting_for_task)
     await message.answer(
         "Введите текст задачи одним сообщением.\n"
         "Чтобы отменить добавление, отправьте /cancel.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=main_menu_keyboard(),
     )
 
 
 @router.message(
     Command("cancel"),
-    StateFilter(AddTaskStates.waiting_for_task, AddTaskStates.waiting_for_category),
+    StateFilter(
+        AddTaskStates.waiting_for_task,
+        AddTaskStates.waiting_for_category,
+        DoneTaskStates.waiting_for_id,
+    ),
 )
-async def cmd_cancel_add(message: types.Message, state: FSMContext) -> None:
-    """Отменяет добавление задачи и выходит из FSM.
-
-    Срабатывает и на шаге текста, и на шаге категории.
-    """
+async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
+    """Отменяет текущий диалог (/add или /done) и возвращает меню."""
     await state.clear()
-    await message.answer(
-        "Добавление задачи отменено.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await message.answer("Действие отменено.", reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("list"))
-async def cmd_list(message: types.Message) -> None:
+async def cmd_list(message: types.Message, state: FSMContext) -> None:
     """Выводит все задачи из БД в заданном формате.
 
     Формат строки: [ID] Текст (Категория: ..., Статус: ...).
     Telegram ограничивает длину сообщения ~4096 символов,
     поэтому длинный список разбиваем на несколько сообщений.
     """
+    await state.clear()
     tasks = await get_all_tasks()
     if not tasks:
-        await message.answer("Список задач пуст. Добавьте первую через /add.")
+        await message.answer(
+            "Список задач пуст. Добавьте первую через /add.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     lines = [
@@ -335,7 +424,10 @@ async def cmd_list(message: types.Message) -> None:
     header = "Список задач:\n\n"
 
     async def send_chunk(parts: list[str]) -> None:
-        await message.answer(header + "\n".join(parts))
+        await message.answer(
+            header + "\n".join(parts),
+            reply_markup=main_menu_keyboard(),
+        )
 
     for line in lines:
         extra = len(line) + 1  # +1 за перевод строки
@@ -351,16 +443,20 @@ async def cmd_list(message: types.Message) -> None:
 
 
 @router.message(Command("list_csv"))
-async def cmd_list_csv(message: types.Message) -> None:
+async def cmd_list_csv(message: types.Message, state: FSMContext) -> None:
     """Генерирует CSV и отправляет его документом.
 
     Колонки: ID, Задача, Пользователь, Дата, Статус, Категория.
     BufferedInputFile позволяет отдать файл из памяти, без записи на диск.
     Кодировка utf-8-sig удобна для открытия в Excel (BOM для кириллицы).
     """
+    await state.clear()
     tasks = await get_all_tasks()
     if not tasks:
-        await message.answer("Список задач пуст, CSV формировать нечего.")
+        await message.answer(
+            "Список задач пуст, CSV формировать нечего.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     buffer = io.StringIO()
@@ -386,33 +482,45 @@ async def cmd_list_csv(message: types.Message) -> None:
     await message.answer_document(
         document=document,
         caption="Выгрузка задач в CSV.",
+        reply_markup=main_menu_keyboard(),
     )
 
 
 @router.message(Command("done"))
-async def cmd_done(message: types.Message, command: CommandObject) -> None:
-    """Отмечает задачу выполненной: /done 1 → status = «Выполнено».
+async def cmd_done(message: types.Message, state: FSMContext, command: CommandObject) -> None:
+    """Отмечает задачу выполненной.
 
-    CommandObject.args — это текст после команды, то есть id.
+    /done 1 — сразу обновляет статус.
+    /done без номера или кнопка «/done <id>» — спрашиваем номер отдельным шагом.
+    Кнопка меню отправляет текст «/done <id>», и Telegram разбирает это как команду done.
     """
-    raw_id = (command.args or "").strip()
-    if not raw_id:
-        await message.answer("Укажите номер задачи: /done 1")
+    task_id = parse_task_id(command.args)
+    if task_id is None:
+        await ask_done_id(message, state)
         return
+    await finish_done(message, task_id, state)
 
-    if not raw_id.isdigit():
-        await message.answer("ID должен быть числом. Пример: /done 1")
+
+@router.message(DoneTaskStates.waiting_for_id, F.text)
+async def process_done_id(message: types.Message, state: FSMContext) -> None:
+    """Принимает номер задачи после запроса и ставит статус «Выполнено»."""
+    task_id = parse_task_id(message.text)
+    if task_id is None:
+        await message.answer(
+            "Нужен номер задачи цифрами. Пример: 1\n"
+            "Посмотреть номера можно в /list. Отмена: /cancel.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
+    await finish_done(message, task_id, state)
 
-    task = await mark_task_done(int(raw_id))
-    if task is None:
-        await message.answer(f"Задача с ID {raw_id} не найдена.")
-        return
 
-    task_id, text, status, category = task
+@router.message(DoneTaskStates.waiting_for_id)
+async def process_done_id_non_text(message: types.Message) -> None:
+    """Если вместо номера прислали файл или стикер."""
     await message.answer(
-        f"Задача [{task_id}] отмечена как «{status}».\n"
-        f"{text} (Категория: {category})"
+        "Нужен номер задачи цифрами. Посмотреть номера можно в /list.",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -463,7 +571,7 @@ async def process_task_category(message: types.Message, state: FSMContext) -> No
         await state.clear()
         await message.answer(
             "Не удалось найти текст задачи. Начните заново через /add.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -478,7 +586,7 @@ async def process_task_category(message: types.Message, state: FSMContext) -> No
         f"{task_text}\n"
         f"Категория: {category}\n"
         f"Статус: {DEFAULT_STATUS}",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -491,17 +599,33 @@ async def process_category_non_text(message: types.Message) -> None:
     )
 
 
-@router.message(F.text.startswith("/"))
-async def unknown_command(message: types.Message) -> None:
-    """Подсказка, если пользователь ввёл неизвестную команду."""
-    await message.answer(
-        "Неизвестная команда. Используйте /start, /add, /list, /list_csv или /done <id>."
-    )
+@router.message()
+async def fallback_welcome(message: types.Message, state: FSMContext) -> None:
+    """Любое сообщение вне команд и FSM — то же приветствие, что у /start.
+
+    Так пользователь всегда видит список команд и кнопки меню.
+    """
+    await state.clear()
+    await send_welcome(message)
 
 
 # ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Регистрирует команды в системном меню Telegram (кнопка «/» слева от поля ввода)."""
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="меню/start — приветствие и список команд"),
+            BotCommand(command="add", description="Добавить задачу"),
+            BotCommand(command="list", description="Показать все задачи"),
+            BotCommand(command="list_csv", description="Скачать задачи в CSV"),
+            BotCommand(command="done", description="Отметить задачу выполненной"),
+            BotCommand(command="cancel", description="Отменить текущее действие"),
+        ]
+    )
+
 
 async def main() -> None:
     """Запускает бота: готовит БД, создаёт Bot/Dispatcher и начинает polling.
@@ -519,6 +643,7 @@ async def main() -> None:
     await init_db()
 
     bot = Bot(token=BOT_TOKEN)
+    await setup_bot_commands(bot)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
